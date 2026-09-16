@@ -1,5 +1,6 @@
 import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 
+import { AUDIO_FILE_ACCEPT } from '../storage/audio-formats';
 import { Layer, MAX_LAYERS_PER_PAD } from '../storage/models';
 import { NOTE_NAMES, formatShift, formatTime, noteName, totalSemitones } from '../audio/music';
 import { StudioStore } from '../state/studio.store';
@@ -66,11 +67,11 @@ import { Waveform } from './waveform';
         (drop)="onDrop($event)"
       >
         <app-icon name="upload" [size]="22" />
-        <span class="text-sm font-medium">Drop WAV files here or <span class="underline decoration-dotted underline-offset-2">browse</span></span>
+        <span class="text-sm font-medium">Drop audio files here or <span class="underline decoration-dotted underline-offset-2">browse</span></span>
         <span class="text-xs text-ink-400">Each file becomes a layer on {{ names[pad] }}. Key is read from the file name, or detected from the audio.</span>
         <input
           type="file"
-          accept=".wav,.wave,audio/wav,audio/x-wav,audio/wave"
+          [attr.accept]="accept"
           multiple
           class="sr-only"
           [disabled]="layers.length >= max"
@@ -116,7 +117,7 @@ import { Waveform } from './waveform';
                 <div class="mt-0.5 flex flex-wrap gap-x-2 text-[11px] text-ink-400">
                   <span>{{ fmt(layer.durationSeconds) }}</span>
                   <span>{{ (layer.sampleRate / 1000).toFixed(1) }} kHz</span>
-                  <span>{{ layer.bitsPerSample }}-bit {{ layer.channels === 1 ? 'mono' : layer.channels === 2 ? 'stereo' : layer.channels + 'ch' }}</span>
+                  <span>{{ layer.bitsPerSample ? layer.bitsPerSample + '-bit ' : '' }}{{ layer.channels === 1 ? 'mono' : layer.channels === 2 ? 'stereo' : layer.channels + 'ch' }}</span>
                   @if (layer.detectedKey) {
                     <span title="Detected from the audio">≈ {{ layer.detectedKey }}</span>
                   }
@@ -205,7 +206,7 @@ import { Waveform } from './waveform';
           </li>
         } @empty {
           <li class="rounded-xl border border-white/5 px-4 py-8 text-center text-sm text-ink-400">
-            No samples on {{ names[pad] }} yet. Add one or more WAVs to layer them.
+            No samples on {{ names[pad] }} yet. Add one or more audio files to layer them.
           </li>
         }
       </ol>
@@ -222,6 +223,7 @@ export class PadInspector {
   protected readonly note = noteName;
   protected readonly formatShift = formatShift;
   protected readonly dropping = signal(false);
+  protected readonly accept = AUDIO_FILE_ACCEPT;
 
   protected readonly uploadsHere = computed(() =>
     this.store.uploads().filter((u) => u.padIndex === this.store.selectedPad()),

@@ -3,6 +3,7 @@ import { Injectable, computed, effect, inject, signal, untracked } from '@angula
 import { AudioEngineService } from '../audio/audio-engine.service';
 import { detectKey } from '../audio/key-detect';
 import { guessKeyFromFilename, noteName } from '../audio/music';
+import { isSupportedAudioFile } from '../storage/audio-formats';
 import { safeFileName } from '../storage/kit-file';
 import { LibraryService } from '../storage/library.service';
 import { KitDetail, KitPatch, KitSummary, Layer, LayerPatch } from '../storage/models';
@@ -268,8 +269,8 @@ export class StudioStore {
     const kit = this.kit();
     if (!kit) return;
     for (const file of files) {
-      if (!/\.wave?$/i.test(file.name)) {
-        this.error(`${file.name}: only .wav files are supported`);
+      if (!isSupportedAudioFile(file.name)) {
+        this.error(`${file.name}: unsupported audio format`);
         continue;
       }
       await this.addFile(kit.id, padIndex, file);
@@ -298,13 +299,13 @@ export class StudioStore {
       detectedKey = est.label;
       rootNote ??= est.tonic;
     } catch {
-      fail('your browser could not decode this WAV file');
+      fail('your browser could not decode this audio file');
       return;
     }
 
     setJob({ stage: 'saving' });
     try {
-      const layer = await this.library.addLayer(kitId, padIndex, file, { rootNote, detectedKey });
+      const layer = await this.library.addLayer(kitId, padIndex, file, buffer, { rootNote, detectedKey });
       if (this.kit()?.id === kitId) {
         this.engine.prime(layer.id, buffer);
         this.layers.update((ls) => [...ls, layer]);

@@ -1,16 +1,17 @@
 import { Injectable, signal } from '@angular/core';
 
 import { guessKeyFromFilename } from '../audio/music';
+import { inspectAudio, isSupportedAudioFile, isWavFile } from './audio-formats';
 import { DbRequest, DbResponse, SqlValue, Statement } from './db-protocol';
 import { decodeKitFile, encodeKitFile } from './kit-file';
 import { KitDetail, KitPatch, KitSettings, KitSummary, Layer, LayerPatch, MAX_LAYERS_PER_PAD } from './models';
-import { InvalidWavError, inspectWav } from './wav';
+import { inspectWav } from './wav';
 
 type Row = Record<string, unknown>;
 
 /**
- * The app's data layer: kits, layers and WAV data stored in SQLite inside the
- * browser. Everything stays on this device; no server is involved.
+ * The app's data layer: kits, layers and audio data stored in SQLite inside
+ * the browser. Everything stays on this device; no server is involved.
  */
 @Injectable({ providedIn: 'root' })
 export class LibraryService {
@@ -151,20 +152,26 @@ export class LibraryService {
   // Layers
   // ------------------------------------------------------------------
 
-  /** Validates and stores a WAV as a new layer. */
+  /** Validates and stores an audio file as a new layer. `buffer` is the file already decoded (e.g. for key detection), reused here to avoid decoding twice. */
   async addLayer(
     kitId: number,
     padIndex: number,
     file: File,
+    buffer: AudioBuffer,
     opts: { rootNote?: number | null; detectedKey?: string | null } = {},
   ): Promise<Layer> {
-    if (!/\.wave?$/i.test(file.name)) throw new InvalidWavError('Only .wav files are supported');
+    if (!isSupportedAudioFile(file.name)) throw new Error(`${file.name}: unsupported audio format`);
     const data = new Uint8Array(await file.arrayBuffer());
+    const bitsPerSample = isWavFile(file.name) ? inspectWav(data).bitsPerSample : 0;
     const root = opts.rootNote !== undefined ? opts.rootNote : guessKeyFromFilename(file.name);
-    return this.insertLayer(kitId, padIndex, file.name, data, {
-      rootNote: root,
-      detectedKey: opts.detectedKey ?? null,
-    });
+    return this.insertLayer(
+      kitId,
+      padIndex,
+      file.name,
+      data,
+      { sampleRate: buffer.sampleRate, channels: buffer.numberOfChannels, bitsPerSample, durationSeconds: buffer.duration },
+      { rootNote: root, detectedKey: opts.detectedKey ?? null },
+    );
   }
 
   private async insertLayer(
@@ -172,10 +179,10 @@ export class LibraryService {
     padIndex: number,
     name: string,
     data: Uint8Array,
+    info: { sampleRate: number; channels: number; bitsPerSample: number; durationSeconds: number },
     extra: Partial<Layer>,
   ): Promise<Layer> {
     if (!(padIndex >= 0 && padIndex <= 11)) throw new Error('Pad index must be between 0 and 11');
-    const info = inspectWav(data);
     const count = await this.query('SELECT COUNT(*) AS n FROM layer WHERE kit_id = ? AND pad_index = ?', kitId, padIndex);
     if (Number(count[0]['n']) >= MAX_LAYERS_PER_PAD) {
       throw new Error(`That pad already has ${MAX_LAYERS_PER_PAD} layers`);
@@ -242,7 +249,7 @@ export class LibraryService {
     await this.query('DELETE FROM layer WHERE id = ?', id);
   }
 
-  /** The stored WAV bytes for a layer. */
+  /** The stored audio bytes for a layer. */
   async getAudio(layerId: number): Promise<ArrayBuffer> {
     const rows = await this.query('SELECT data FROM sample WHERE layer_id = ?', layerId);
     const data = rows[0]?.['data'];
@@ -271,13 +278,17 @@ export class LibraryService {
     let name = header.kit.name || 'Imported kit';
     for (let i = 2; existing.has(name); i++) name = `${header.kit.name} (${i})`;
     const kit = await this.createKit(name, header.kit);
+    const ctx = new AudioContext();
     try {
       for (const [i, l] of header.layers.entries()) {
-        await this.insertLayer(kit.id, l.padIndex, l.originalName, samples[i], l);
+        const info = await inspectAudio(samples[i], l.originalName, ctx);
+        await this.insertLayer(kit.id, l.padIndex, l.originalName, samples[i], info, l);
       }
     } catch (err) {
       await this.deleteKit(kit.id);
       throw err;
+    } finally {
+      void ctx.close();
     }
     return this.getKit(kit.id);
   }

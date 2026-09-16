@@ -21,7 +21,7 @@ const COLUMN: Record<number, number> = { 0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 7, 6: 
         <h2 class="text-sm font-semibold tracking-wide text-ink-300">Pads</h2>
         <p class="hidden text-right text-xs text-ink-400 sm:block">
           {{ store.padMode() === 'latch' ? 'Tap a pad to sustain it, tap again to fade out.' : 'Hold a pad to play it.' }}
-          Keys <kbd class="font-mono text-ink-300">A W S E D F T G Y H U J</kbd>. Drop WAVs on any pad.
+          Keys <kbd class="font-mono text-ink-300">A W S E D F T G Y H U J</kbd>. Drop audio files on any pad.
         </p>
       </div>
       <div class="grid grid-cols-14 gap-1.5 sm:gap-2.5" role="group">
@@ -72,7 +72,7 @@ const COLUMN: Record<number, number> = { 0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 7, 6: 
               @if (armed && engine.state() !== 'playing') {
                 <span class="text-[9px] font-semibold tracking-wider text-amber-300 uppercase">queued</span>
               } @else if (!layers.length) {
-                <span class="text-[10px] text-ink-400 opacity-0 transition group-hover:opacity-100">+ wav</span>
+                <span class="text-[10px] text-ink-400 opacity-0 transition group-hover:opacity-100">+ audio</span>
               }
             </div>
           </button>
