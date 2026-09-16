@@ -1,0 +1,14 @@
+{
+  // Run and Debug panel (Ctrl+Shift+D)
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "PadLoop (Chrome)",
+      "type": "chrome",
+      "request": "launch",
+      "preLaunchTask": "dev server",
+      "url": "http://localhost:4200/",
+      "webRoot": "${workspaceFolder}"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  // Terminal > Run Task...
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "install",
+      "type": "shell",
+      "command": "npm install",
+      "problemMatcher": []
+    },
+    {
+      "label": "dev server",
+      "type": "shell",
+      "command": "npm start",
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "typescript",
+        "pattern": "$tsc",
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": { "regexp": "Changes detected|Building" },
+          "endsPattern": { "regexp": "bundle generation (complete|failed)" }
+        }
+      }
+    },
+    {
+      "label": "test",
+      "type": "shell",
+      "command": "npm test",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "production build",
+      "type": "shell",
+      "command": "npm run build",
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+/* TypeScript config for web workers (the SQLite storage worker). */
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./out-tsc/worker",
+    "lib": ["es2022", "webworker"],
+    "types": []
+  },
+  "include": ["src/**/*.worker.ts"]
+}
