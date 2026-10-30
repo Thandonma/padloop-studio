@@ -1,7 +1,7 @@
 /**
- * Which audio file types PadLoop accepts as pad layers. WAV headers are read
- * directly without decoding (see wav.ts); other formats are handed to the
- * browser's own decoder, so support follows whatever codecs the browser ships.
+ * Which audio file types PadLoop accepts. WAV headers are read directly
+ * without decoding (see wav.ts); other formats are handed to the browser's own
+ * decoder, so support follows whatever codecs the browser ships.
  */
 import { WavInfo, inspectWav } from './wav';
 
@@ -21,20 +21,28 @@ export function isWavFile(name: string): boolean {
   return /\.wave?$/i.test(name);
 }
 
-/**
- * Header metadata for a layer being stored. WAV files are parsed directly;
- * other formats are decoded once to read their sample rate/channels/duration
- * (bit depth isn't meaningful once decoded, so it's reported as 0).
- */
-export async function inspectAudio(data: Uint8Array, filename: string, ctx: AudioContext): Promise<WavInfo> {
-  if (isWavFile(filename)) return inspectWav(data);
-  const copy = data.slice();
-  const buffer = await ctx.decodeAudioData(copy.buffer as ArrayBuffer);
+/** Facts about a decoded buffer, in the same shape a WAV header gives us. */
+export function infoFromBuffer(buffer: AudioBuffer): WavInfo {
   return {
     formatCode: 0,
     channels: buffer.numberOfChannels,
     sampleRate: buffer.sampleRate,
+    // Bit depth isn't meaningful once a file has been decoded.
     bitsPerSample: 0,
     durationSeconds: buffer.duration,
   };
+}
+
+/**
+ * Header metadata for a file being stored. WAV files are parsed directly;
+ * anything else is decoded once with the supplied decoder.
+ */
+export async function inspectAudio(
+  data: Uint8Array,
+  filename: string,
+  decode: (bytes: ArrayBuffer) => Promise<AudioBuffer>,
+): Promise<WavInfo> {
+  if (isWavFile(filename)) return inspectWav(data);
+  // decodeAudioData detaches the buffer it is given, so hand it a copy.
+  return infoFromBuffer(await decode(data.slice().buffer as ArrayBuffer));
 }

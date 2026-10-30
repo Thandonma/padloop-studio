@@ -2,17 +2,17 @@ import { Injectable, computed, effect, inject, signal, untracked } from '@angula
 
 import { AudioEngineService } from '../audio/audio-engine.service';
 import { detectKey } from '../audio/key-detect';
-import { guessKeyFromFilename, noteName } from '../audio/music';
-import { isSupportedAudioFile } from '../storage/audio-formats';
+import { guessKeyFromFilename } from '../audio/music';
+import { infoFromBuffer, isSupportedAudioFile } from '../storage/audio-formats';
 import { safeFileName } from '../storage/kit-file';
 import { LibraryService } from '../storage/library.service';
-import { KitDetail, KitPatch, KitSummary, Layer, LayerPatch } from '../storage/models';
+import { KitDetail, KitPatch, KitSummary, MAX_SOUNDS_PER_KIT, Sound, SoundPatch } from '../storage/models';
+import { STARTER_PADS, StarterPad, fetchStarterPad } from '../storage/starter-pads';
 
-export interface UploadJob {
+export interface LoadJob {
   id: string;
-  padIndex: number;
-  fileName: string;
-  stage: 'analysing' | 'saving' | 'error';
+  name: string;
+  stage: 'reading' | 'saving' | 'error';
   error?: string;
 }
 
@@ -23,8 +23,9 @@ export interface Toast {
 }
 
 const LAST_KIT_KEY = 'padloop.lastKit';
+const ADVANCED_KEY = 'padloop.advanced';
 
-/** Application state: the open kit and its layers, wired to storage and the audio engine. */
+/** Application state: the open kit and its sounds, wired to storage and audio. */
 @Injectable({ providedIn: 'root' })
 export class StudioStore {
   private readonly library = inject(LibraryService);
@@ -32,40 +33,42 @@ export class StudioStore {
 
   readonly kits = signal<KitSummary[]>([]);
   readonly kit = signal<KitDetail | null>(null);
-  readonly layers = signal<Layer[]>([]);
-  readonly selectedPad = signal(0);
-  readonly uploads = signal<UploadJob[]>([]);
+  readonly sounds = signal<Sound[]>([]);
+  readonly jobs = signal<LoadJob[]>([]);
   readonly toasts = signal<Toast[]>([]);
   readonly loadingKit = signal(false);
   readonly storageError = signal<string | null>(null);
   readonly persistent = this.library.persistent;
   readonly busy = signal(false);
-  /** 'latch': tap to sustain / tap again to release. 'hold': sound only while held. */
-  readonly padMode = signal<'latch' | 'hold'>('latch');
+  /** Shows the extra tuning and mixing controls. */
+  readonly advanced = signal(safeGet(ADVANCED_KEY) === '1');
 
-  readonly layersByPad = computed(() => {
-    const byPad: Layer[][] = Array.from({ length: 12 }, () => []);
-    for (const l of this.layers()) byPad[l.padIndex]?.push(l);
-    return byPad;
-  });
-
-  readonly selectedLayers = computed(() => this.layersByPad()[this.selectedPad()] ?? []);
+  readonly starterPads = STARTER_PADS;
+  readonly maxSounds = MAX_SOUNDS_PER_KIT;
+  readonly hasSounds = computed(() => this.sounds().length > 0);
+  readonly isFull = computed(() => this.sounds().length >= MAX_SOUNDS_PER_KIT);
+  readonly loadedStarterIds = computed(
+    () => new Set(this.sounds().map((s) => s.starterId).filter((id): id is string => !!id)),
+  );
 
   private toastSeq = 0;
   private kitSaveTimer?: ReturnType<typeof setTimeout>;
   private pendingKitPatch: KitPatch = {};
-  private layerSaveTimers = new Map<number, ReturnType<typeof setTimeout>>();
-  private pendingLayerPatches = new Map<number, LayerPatch>();
+  private soundSaveTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  private pendingSoundPatches = new Map<number, SoundPatch>();
 
   constructor() {
     this.engine.setAudioLoader((id) => this.library.getAudio(id));
-    // Keep the engine's view of the layers in sync with the store.
     effect(() => {
-      const layers = this.layers();
-      untracked(() => this.engine.setLayers(layers));
+      const sounds = this.sounds();
+      untracked(() => this.engine.setSounds(sounds));
     });
-    // Save pending edits if the tab is closed.
+    effect(() => safeSet(ADVANCED_KEY, this.advanced() ? '1' : '0'));
     addEventListener('pagehide', () => this.flushSaves());
+  }
+
+  toggleAdvanced(): void {
+    this.advanced.update((v) => !v);
   }
 
   // ------------------------------------------------------------------
@@ -81,7 +84,7 @@ export class StudioStore {
       const remembered = Number(safeGet(LAST_KIT_KEY));
       if (remembered && this.kits().some((k) => k.id === remembered)) target = remembered;
       if (target == null) {
-        const created = await this.library.createKit('My first kit');
+        const created = await this.library.createKit('My kit');
         await this.refreshKits();
         target = created.id;
       }
@@ -104,8 +107,7 @@ export class StudioStore {
       this.engine.forgetAll();
       this.applyKitSettings(kit);
       this.kit.set(kit);
-      this.layers.set(kit.layers);
-      this.selectedPad.set(kit.layers[0]?.padIndex ?? 0);
+      this.sounds.set(kit.sounds);
       safeSet(LAST_KIT_KEY, String(id));
     } catch (err) {
       this.error(err);
@@ -132,12 +134,12 @@ export class StudioStore {
       this.clearPendingSaves();
       await this.library.deleteKit(kit.id);
       this.kit.set(null);
-      this.layers.set([]);
+      this.sounds.set([]);
       this.engine.forgetAll();
       await this.refreshKits();
       const next = this.kits()[0];
       if (next) await this.openKit(next.id);
-      else await this.createKit('My first kit');
+      else await this.createKit('My kit');
       this.info(`Deleted “${kit.name}”`);
     } catch (err) {
       this.error(err);
@@ -171,7 +173,7 @@ export class StudioStore {
       const kit = await this.library.importKit(file);
       await this.refreshKits();
       await this.openKit(kit.id);
-      this.info(`Imported “${kit.name}” with ${kit.layers.length} layers`);
+      this.info(`Imported “${kit.name}” with ${kit.sounds.length} sounds`);
     } catch (err) {
       this.error(err);
     } finally {
@@ -214,7 +216,6 @@ export class StudioStore {
     this.engine.setKeyLock(kit.keyLock);
   }
 
-  /** Optimistic local update + debounced save. */
   private patchKit(patch: KitPatch): void {
     const kit = this.kit();
     if (!kit) return;
@@ -245,49 +246,69 @@ export class StudioStore {
       this.kitSaveTimer = undefined;
       void this.saveKit(kit.id);
     }
-    for (const [id, t] of this.layerSaveTimers) {
+    for (const [id, t] of this.soundSaveTimers) {
       clearTimeout(t);
-      void this.saveLayer(id);
+      void this.saveSound(id);
     }
-    this.layerSaveTimers.clear();
+    this.soundSaveTimers.clear();
   }
 
   private clearPendingSaves(): void {
     clearTimeout(this.kitSaveTimer);
     this.kitSaveTimer = undefined;
     this.pendingKitPatch = {};
-    for (const t of this.layerSaveTimers.values()) clearTimeout(t);
-    this.layerSaveTimers.clear();
-    this.pendingLayerPatches.clear();
+    for (const t of this.soundSaveTimers.values()) clearTimeout(t);
+    this.soundSaveTimers.clear();
+    this.pendingSoundPatches.clear();
   }
 
   // ------------------------------------------------------------------
-  // Layers
+  // Sounds
   // ------------------------------------------------------------------
 
-  async addFiles(padIndex: number, files: File[]): Promise<void> {
+  /** Adds one of the pads that ship with the app. */
+  async addStarterPad(pad: StarterPad): Promise<void> {
     const kit = this.kit();
-    if (!kit) return;
-    for (const file of files) {
-      if (!isSupportedAudioFile(file.name)) {
-        this.error(`${file.name}: unsupported audio format`);
-        continue;
-      }
-      await this.addFile(kit.id, padIndex, file);
+    if (!kit || this.isFull()) {
+      if (this.isFull()) this.error(`A kit holds up to ${MAX_SOUNDS_PER_KIT} sounds. Remove one first.`);
+      return;
+    }
+    const job = this.startJob(pad.name);
+    try {
+      const file = await fetchStarterPad(pad);
+      job.set({ stage: 'saving' });
+      const sound = await this.library.addSound(kit.id, file, {
+        rootNote: pad.rootNote,
+        detectedKey: pad.detectedKey,
+        starterId: pad.id,
+        name: pad.name,
+      });
+      this.attach(kit.id, sound);
+      job.done();
+      this.info(`Added ${pad.name}. Press any key to play it.`);
+    } catch (err) {
+      job.fail(message(err));
     }
   }
 
-  private async addFile(kitId: number, padIndex: number, file: File): Promise<void> {
-    const job: UploadJob = { id: `${Date.now()}-${Math.random()}`, padIndex, fileName: file.name, stage: 'analysing' };
-    this.uploads.update((u) => [...u, job]);
-    const setJob = (patch: Partial<UploadJob>) =>
-      this.uploads.update((u) => u.map((j) => (j.id === job.id ? { ...j, ...patch } : j)));
-    const fail = (msg: string) => {
-      setJob({ stage: 'error', error: msg });
-      this.error(`${file.name}: ${msg}`);
-      setTimeout(() => this.uploads.update((u) => u.filter((j) => j.id !== job.id)), 6000);
-    };
+  async addFiles(files: File[]): Promise<void> {
+    const kit = this.kit();
+    if (!kit) return;
+    for (const file of files) {
+      if (this.isFull()) {
+        this.error(`A kit holds up to ${MAX_SOUNDS_PER_KIT} sounds. Remove one first.`);
+        return;
+      }
+      if (!isSupportedAudioFile(file.name)) {
+        this.error(`${file.name}: that file type isn't supported`);
+        continue;
+      }
+      await this.addFile(kit.id, file);
+    }
+  }
 
+  private async addFile(kitId: number, file: File): Promise<void> {
+    const job = this.startJob(file.name);
     let buffer: AudioBuffer;
     let rootNote = guessKeyFromFilename(file.name);
     let detectedKey: string | null = null;
@@ -299,76 +320,101 @@ export class StudioStore {
       detectedKey = est.label;
       rootNote ??= est.tonic;
     } catch {
-      fail('your browser could not decode this audio file');
+      job.fail('your browser could not decode this audio file');
       return;
     }
-
-    setJob({ stage: 'saving' });
+    job.set({ stage: 'saving' });
     try {
-      const layer = await this.library.addLayer(kitId, padIndex, file, buffer, { rootNote, detectedKey });
-      if (this.kit()?.id === kitId) {
-        this.engine.prime(layer.id, buffer);
-        this.layers.update((ls) => [...ls, layer]);
-        this.kits.update((ks) => ks.map((k) => (k.id === kitId ? { ...k, layerCount: k.layerCount + 1 } : k)));
-      }
-      this.uploads.update((u) => u.filter((j) => j.id !== job.id));
-      this.info(`${file.name} → pad ${noteName(padIndex)} (recorded in ${noteName(layer.rootNote)})`);
+      // The decode above already tells us the sample rate, channels and length,
+      // which is the only way to know them for compressed formats.
+      const sound = await this.library.addSound(kitId, file, {
+        rootNote,
+        detectedKey,
+        info: infoFromBuffer(buffer),
+      });
+      this.engine.prime(sound.id, buffer);
+      this.attach(kitId, sound);
+      job.done();
+      this.info(`Added ${sound.name}. It plays in whichever key you press.`);
     } catch (err) {
-      fail(message(err));
+      job.fail(message(err));
     }
   }
 
-  updateLayer(id: number, patch: LayerPatch): void {
-    this.layers.update((ls) =>
-      ls.map((l) => {
-        if (l.id !== id) return l;
+  private attach(kitId: number, sound: Sound): void {
+    if (this.kit()?.id !== kitId) return;
+    this.sounds.update((ss) => [...ss, sound]);
+    this.kits.update((ks) => ks.map((k) => (k.id === kitId ? { ...k, soundCount: k.soundCount + 1 } : k)));
+  }
+
+  updateSound(id: number, patch: SoundPatch): void {
+    this.sounds.update((ss) =>
+      ss.map((s) => {
+        if (s.id !== id) return s;
         const { clearRootNote, ...fields } = patch;
-        const next: Layer = { ...l, ...fields };
+        const next: Sound = { ...s, ...fields };
         if (clearRootNote) next.rootNote = null;
         return next;
       }),
     );
-    this.pendingLayerPatches.set(id, { ...(this.pendingLayerPatches.get(id) ?? {}), ...patch });
-    clearTimeout(this.layerSaveTimers.get(id));
-    this.layerSaveTimers.set(
+    this.pendingSoundPatches.set(id, { ...(this.pendingSoundPatches.get(id) ?? {}), ...patch });
+    clearTimeout(this.soundSaveTimers.get(id));
+    this.soundSaveTimers.set(
       id,
       setTimeout(() => {
-        this.layerSaveTimers.delete(id);
-        void this.saveLayer(id);
+        this.soundSaveTimers.delete(id);
+        void this.saveSound(id);
       }, 350),
     );
   }
 
-  private async saveLayer(id: number): Promise<void> {
-    const patch = this.pendingLayerPatches.get(id);
-    this.pendingLayerPatches.delete(id);
+  private async saveSound(id: number): Promise<void> {
+    const patch = this.pendingSoundPatches.get(id);
+    this.pendingSoundPatches.delete(id);
     if (!patch) return;
     try {
-      await this.library.updateLayer(id, patch);
+      await this.library.updateSound(id, patch);
     } catch (err) {
       this.error(err);
     }
   }
 
-  async deleteLayer(id: number): Promise<void> {
-    const layer = this.layers().find((l) => l.id === id);
-    if (!layer) return;
-    clearTimeout(this.layerSaveTimers.get(id));
-    this.layerSaveTimers.delete(id);
-    this.pendingLayerPatches.delete(id);
-    this.layers.update((ls) => ls.filter((l) => l.id !== id));
+  async deleteSound(id: number): Promise<void> {
+    const sound = this.sounds().find((s) => s.id === id);
+    if (!sound) return;
+    clearTimeout(this.soundSaveTimers.get(id));
+    this.soundSaveTimers.delete(id);
+    this.pendingSoundPatches.delete(id);
+    this.sounds.update((ss) => ss.filter((s) => s.id !== id));
     try {
-      await this.library.deleteLayer(id);
-      this.kits.update((ks) => ks.map((k) => (k.id === layer.kitId ? { ...k, layerCount: k.layerCount - 1 } : k)));
+      await this.library.deleteSound(id);
+      this.kits.update((ks) => ks.map((k) => (k.id === sound.kitId ? { ...k, soundCount: k.soundCount - 1 } : k)));
     } catch (err) {
-      this.layers.update((ls) => [...ls, layer].sort((a, b) => a.padIndex - b.padIndex || a.position - b.position));
+      this.sounds.update((ss) => [...ss, sound].sort((a, b) => a.position - b.position));
       this.error(err);
     }
   }
 
   // ------------------------------------------------------------------
-  // Messages
+  // Jobs and messages
   // ------------------------------------------------------------------
+
+  private startJob(name: string) {
+    const job: LoadJob = { id: `${Date.now()}-${Math.random()}`, name, stage: 'reading' };
+    this.jobs.update((j) => [...j, job]);
+    const update = (patch: Partial<LoadJob>) =>
+      this.jobs.update((j) => j.map((x) => (x.id === job.id ? { ...x, ...patch } : x)));
+    const drop = () => this.jobs.update((j) => j.filter((x) => x.id !== job.id));
+    return {
+      set: update,
+      done: drop,
+      fail: (msg: string) => {
+        update({ stage: 'error', error: msg });
+        this.error(`${name}: ${msg}`);
+        setTimeout(drop, 6000);
+      },
+    };
+  }
 
   info(text: string): void {
     this.toast('info', text);

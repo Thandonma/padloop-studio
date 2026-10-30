@@ -1,6 +1,6 @@
 import { computePeaks, makeSeamless } from './loop';
 import { detectKey } from './key-detect';
-import { formatTime, guessKeyFromFilename, rateForSemitones, semitoneShift, totalSemitones } from './music';
+import { NOTE_NAMES, formatTime, guessKeyFromFilename, rateForSemitones, semitoneShift, totalSemitones } from './music';
 import { offsetAt, retune, startPhase } from './phase';
 
 describe('music helpers', () => {
@@ -40,6 +40,30 @@ describe('music helpers', () => {
     expect(formatTime(0)).toBe('00:00');
     expect(formatTime(605.9)).toBe('10:05');
     expect(formatTime(3725)).toBe('1:02:05');
+  });
+});
+
+describe('one sound across all twelve keys', () => {
+  // The headline behaviour: a single recording is re-tuned to whichever key
+  // you press, always by the shortest route, and never more than half an octave.
+  it('re-tunes a sound recorded in A to every key', () => {
+    const sound = { rootNote: 9, octave: 0, fineTuneCents: 0 };
+    const rates = NOTE_NAMES.map((_, key) => rateForSemitones(totalSemitones({ ...sound, padIndex: key }, true)));
+    expect(rates[9]).toBe(1); // its own key plays untouched
+    expect(rates[10]).toBeCloseTo(Math.pow(2, 1 / 12)); // A -> A#, a semitone up
+    expect(rates[8]).toBeCloseTo(Math.pow(2, -1 / 12)); // A -> G#, a semitone down
+    for (const rate of rates) {
+      expect(rate).toBeGreaterThanOrEqual(Math.pow(2, -6 / 12));
+      expect(rate).toBeLessThanOrEqual(Math.pow(2, 5 / 12));
+    }
+    expect(new Set(rates).size).toBe(12); // each key really is a different pitch
+  });
+
+  it('leaves the pitch alone when the key is unknown or key lock is off', () => {
+    const unknownKey = { padIndex: 7, rootNote: null, octave: 0, fineTuneCents: 0 };
+    expect(rateForSemitones(totalSemitones(unknownKey, true))).toBe(1);
+    const lockOff = { padIndex: 7, rootNote: 0, octave: 0, fineTuneCents: 0 };
+    expect(rateForSemitones(totalSemitones(lockOff, false))).toBe(1);
   });
 });
 

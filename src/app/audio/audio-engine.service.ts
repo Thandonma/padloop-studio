@@ -4,10 +4,9 @@ import { computePeaks, crossfadeSeconds, makeSeamless } from './loop';
 import { rateForSemitones, totalSemitones } from './music';
 import { LoopPhase, offsetAt, retune, startPhase } from './phase';
 
-/** What the engine needs to know about a layer. */
-export interface EngineLayer {
+/** What the engine needs to know about one sound in the kit. */
+export interface EngineSound {
   id: number;
-  padIndex: number;
   rootNote: number | null;
   octave: number;
   fineTuneCents: number;
@@ -15,42 +14,44 @@ export interface EngineLayer {
   enabled: boolean;
 }
 
-export type TransportState = 'stopped' | 'playing' | 'paused';
-
 interface Voice {
   source: AudioBufferSourceNode;
   gain: GainNode;
 }
 
-interface PadBus {
+/** Everything sounding in one key: a bus plus one voice per enabled sound. */
+interface Rig {
+  key: number;
   gain: GainNode;
   voices: Map<number, Voice>;
 }
 
-const CLICK_FADE = 0.03; // seconds; used for pause / seek so nothing pops
+const CLICK_FADE = 0.03; // seconds, used where a fade only needs to avoid a pop
 
 /**
- * Web Audio engine: sustains any number of looping layers per pad, keeps
- * them on a shared session timeline and supports pause / resume / seek.
+ * Web Audio engine. Press a key and every enabled sound in the kit sustains in
+ * that key, looping, until you press it again. Pressing another key moves the
+ * whole thing across in a crossfade, so the music never stops abruptly.
  *
  * Signal graph:
- *   source -> layerGain -> padGain -> sessionGain -> masterGain -> limiter -> analyser -> out
+ *   source -> sound gain -> key bus -> session gain -> master -> limiter -> analyser -> out
  */
 @Injectable({ providedIn: 'root' })
 export class AudioEngineService {
   // ----- public reactive state -----
-  readonly state = signal<TransportState>('stopped');
+  /** The key currently sounding (0 = C ... 11 = B), or null when silent. */
+  readonly activeKey = signal<number | null>(null);
+  readonly playing = computed(() => this.activeKey() !== null);
   readonly position = signal(0);
   /** Session length in seconds, or null for endless. */
   readonly sessionLength = signal<number | null>(600);
-  readonly armedPads = signal<ReadonlySet<number>>(new Set());
   readonly masterVolume = signal(0.8);
   readonly fadeSeconds = signal(2);
   readonly keyLock = signal(true);
   readonly level = signal(0);
-  /** Layer id -> normalised waveform peaks */
+  /** Sound id -> normalised waveform peaks */
   readonly peaks = signal<ReadonlyMap<number, number[]>>(new Map());
-  /** Layer ids currently being downloaded/decoded */
+  /** Sound ids currently being loaded or decoded */
   readonly loading = signal<ReadonlySet<number>>(new Set());
   readonly ended = signal(false);
 
@@ -66,21 +67,20 @@ export class AudioEngineService {
   private analyser?: AnalyserNode;
   private meterData?: Float32Array<ArrayBuffer>;
 
-  private layers = new Map<number, EngineLayer>();
+  private sounds = new Map<number, EngineSound>();
   private buffers = new Map<number, AudioBuffer>();
   private pending = new Map<number, Promise<AudioBuffer | null>>();
   private phases = new Map<number, LoopPhase>();
-  private pads = new Map<number, PadBus>();
+  private rig: Rig | null = null;
 
-  /** Where layer audio comes from (the local library). */
-  private audioLoader: (layerId: number) => Promise<ArrayBuffer> = () =>
+  private audioLoader: (soundId: number) => Promise<ArrayBuffer> = () =>
     Promise.reject(new Error('No audio loader configured'));
 
   private startCtxTime = 0;
   private startPos = 0;
   private timer: ReturnType<typeof setInterval> | undefined;
 
-  /** Create/resume the AudioContext. Must be called from a user gesture at least once. */
+  /** Create/resume the AudioContext. Must follow a user gesture at least once. */
   async ensureContext(): Promise<AudioContext> {
     const ctx = this.createContext();
     if (ctx.state === 'suspended') {
@@ -115,88 +115,85 @@ export class AudioEngineService {
     return this.createContext().decodeAudioData(data);
   }
 
+  setAudioLoader(loader: (soundId: number) => Promise<ArrayBuffer>): void {
+    this.audioLoader = loader;
+  }
+
   // ------------------------------------------------------------------
-  // Layers
+  // Sounds
   // ------------------------------------------------------------------
 
-  /** Replace the full set of layers (e.g. after loading a kit or editing one). */
-  setLayers(list: EngineLayer[]): void {
-    const next = new Map(list.map((l) => [l.id, { ...l }]));
-    // Removed layers
-    for (const id of [...this.layers.keys()]) {
+  /** Replace the kit's sounds (after loading a kit, or editing one). */
+  setSounds(list: EngineSound[]): void {
+    const next = new Map(list.map((s) => [s.id, { ...s }]));
+    for (const id of [...this.sounds.keys()]) {
       if (!next.has(id)) {
         this.stopVoice(id, CLICK_FADE);
-        this.layers.delete(id);
+        this.sounds.delete(id);
         this.phases.delete(id);
         this.buffers.delete(id);
         this.pending.delete(id);
         this.updatePeaks((m) => m.delete(id));
       }
     }
-    for (const layer of next.values()) {
-      const prev = this.layers.get(layer.id);
-      this.layers.set(layer.id, layer);
-      if (!this.buffers.has(layer.id)) void this.load(layer);
-      if (!prev) {
-        this.onLayerAdded(layer);
-      } else {
-        this.onLayerChanged(prev, layer);
-      }
+    for (const sound of next.values()) {
+      const prev = this.sounds.get(sound.id);
+      this.sounds.set(sound.id, sound);
+      if (!this.buffers.has(sound.id)) void this.load(sound);
+      if (!prev) this.onSoundAdded(sound);
+      else this.onSoundChanged(prev, sound);
     }
   }
 
-  /** Hand the engine an already-decoded buffer (avoids re-downloading after upload). */
-  prime(layerId: number, buffer: AudioBuffer): void {
-    if (!this.buffers.has(layerId)) this.storeBuffer(layerId, buffer);
+  /** Hand the engine an already-decoded buffer (saves re-reading it). */
+  prime(soundId: number, buffer: AudioBuffer): void {
+    if (!this.buffers.has(soundId)) this.storeBuffer(soundId, buffer);
   }
 
   forgetAll(): void {
     this.stop();
-    this.layers.clear();
+    this.sounds.clear();
     this.buffers.clear();
     this.pending.clear();
     this.phases.clear();
-    this.armedPads.set(new Set());
     this.peaks.set(new Map());
   }
 
-  setAudioLoader(loader: (layerId: number) => Promise<ArrayBuffer>): void {
-    this.audioLoader = loader;
+  loopDuration(soundId: number): number {
+    return this.buffers.get(soundId)?.duration ?? 0;
   }
 
-  loopDuration(layerId: number): number {
-    return this.buffers.get(layerId)?.duration ?? 0;
+  /** Playback rate for a sound in the given key. */
+  rateFor(sound: EngineSound, key: number | null): number {
+    const padIndex = key ?? sound.rootNote ?? 0;
+    return rateForSemitones(totalSemitones({ ...sound, padIndex }, this.keyLock()));
   }
 
-  rateFor(layer: EngineLayer): number {
-    return rateForSemitones(totalSemitones(layer, this.keyLock()));
-  }
-
-  private async load(layer: EngineLayer): Promise<AudioBuffer | null> {
-    let p = this.pending.get(layer.id);
+  private async load(sound: EngineSound): Promise<AudioBuffer | null> {
+    let p = this.pending.get(sound.id);
     if (!p) {
-      this.setLoading(layer.id, true);
-      p = this.audioLoader(layer.id)
+      this.setLoading(sound.id, true);
+      p = this.audioLoader(sound.id)
         .then((data) => this.decode(data))
         .then((buf) => {
-          if (!this.layers.has(layer.id)) return null; // deleted meanwhile
-          if (!this.buffers.has(layer.id)) this.storeBuffer(layer.id, buf);
-          return this.buffers.get(layer.id) ?? null;
+          if (!this.sounds.has(sound.id)) return null; // deleted meanwhile
+          if (!this.buffers.has(sound.id)) this.storeBuffer(sound.id, buf);
+          return this.buffers.get(sound.id) ?? null;
         })
         .catch((err) => {
-          console.error(`Could not load layer ${layer.id}`, err);
-          this.pending.delete(layer.id);
+          console.error(`Could not load sound ${sound.id}`, err);
+          this.pending.delete(sound.id);
           return null;
         })
-        .finally(() => this.setLoading(layer.id, false));
-      this.pending.set(layer.id, p);
+        .finally(() => this.setLoading(sound.id, false));
+      this.pending.set(sound.id, p);
     }
     return p;
   }
 
-  private storeBuffer(layerId: number, raw: AudioBuffer): void {
+  private storeBuffer(soundId: number, raw: AudioBuffer): void {
     const channels = Array.from({ length: raw.numberOfChannels }, (_, i) => raw.getChannelData(i));
-    this.updatePeaks((m) => m.set(layerId, computePeaks(channels, 64)));
+    this.updatePeaks((m) => m.set(soundId, computePeaks(channels, 64)));
     const xf = Math.round(crossfadeSeconds(raw.duration) * raw.sampleRate);
     const seamless = makeSeamless(channels, xf);
     const buf = new AudioBuffer({
@@ -205,169 +202,180 @@ export class AudioEngineService {
       sampleRate: raw.sampleRate,
     });
     seamless.forEach((data, i) => buf.copyToChannel(data, i));
-    this.buffers.set(layerId, buf);
-    this.pending.set(layerId, Promise.resolve(buf));
+    this.buffers.set(soundId, buf);
+    this.pending.set(soundId, Promise.resolve(buf));
 
-    // If its pad is already sounding, bring the new layer in now.
-    const layer = this.layers.get(layerId);
-    if (layer && this.state() === 'playing' && this.armedPads().has(layer.padIndex)) {
-      this.startVoice(layer, this.currentPos(), this.fadeSeconds());
-    }
+    // If a key is already sounding, bring the new arrival in with it.
+    const sound = this.sounds.get(soundId);
+    if (sound && this.rig) this.startVoice(sound, this.currentPos(), this.fadeSeconds());
   }
 
-  private onLayerAdded(layer: EngineLayer): void {
+  private onSoundAdded(sound: EngineSound): void {
     const pos = this.currentPos();
-    this.phases.set(layer.id, startPhase(pos, this.rateFor(layer)));
-    if (this.state() === 'playing' && this.armedPads().has(layer.padIndex)) {
-      this.startVoice(layer, pos, this.fadeSeconds());
-    }
+    this.phases.set(sound.id, startPhase(pos, this.rateFor(sound, this.activeKey())));
+    if (this.rig) this.startVoice(sound, pos, this.fadeSeconds());
   }
 
-  private onLayerChanged(prev: EngineLayer, layer: EngineLayer): void {
+  private onSoundChanged(prev: EngineSound, sound: EngineSound): void {
     const pos = this.currentPos();
-    const playing = this.state() === 'playing';
-    if (prev.padIndex !== layer.padIndex) {
-      // Moved to another pad: restart it there.
-      this.stopVoice(layer.id, CLICK_FADE);
-      this.phases.set(layer.id, startPhase(pos, this.rateFor(layer)));
-      if (playing && this.armedPads().has(layer.padIndex)) this.startVoice(layer, pos, this.fadeSeconds());
+    this.applyRate(sound, pos);
+    const voice = this.rig?.voices.get(sound.id);
+    if (!sound.enabled && voice) {
+      // Muted: fade it out and let the voice go, rather than leaving it running silently.
+      this.stopVoice(sound.id, Math.min(0.4, Math.max(CLICK_FADE, this.fadeSeconds())));
       return;
     }
-    this.applyRate(layer, pos);
-    const voice = this.pads.get(layer.padIndex)?.voices.get(layer.id);
-    if (voice) voice.gain.gain.setTargetAtTime(layer.enabled ? layer.gain : 0, this.ctx!.currentTime, 0.02);
-    if (layer.enabled && !prev.enabled && !voice && playing && this.armedPads().has(layer.padIndex)) {
-      this.startVoice(layer, pos, CLICK_FADE);
+    if (voice && this.ctx) {
+      voice.gain.gain.setTargetAtTime(sound.gain, this.ctx.currentTime, 0.02);
+    } else if (sound.enabled && this.rig) {
+      this.startVoice(sound, pos, Math.min(0.4, Math.max(CLICK_FADE, this.fadeSeconds())));
     }
   }
 
-  private applyRate(layer: EngineLayer, pos: number): void {
-    const rate = this.rateFor(layer);
-    const phase = this.phases.get(layer.id);
+  private applyRate(sound: EngineSound, pos: number): void {
+    const rate = this.rateFor(sound, this.activeKey());
+    const phase = this.phases.get(sound.id);
     if (phase && phase.rate !== rate) {
-      this.phases.set(layer.id, retune(phase, pos, rate, this.loopDuration(layer.id)));
+      this.phases.set(sound.id, retune(phase, pos, rate, this.loopDuration(sound.id)));
     }
-    const voice = this.pads.get(layer.padIndex)?.voices.get(layer.id);
+    const voice = this.rig?.voices.get(sound.id);
     if (voice && this.ctx) voice.source.playbackRate.setValueAtTime(rate, this.ctx.currentTime);
   }
 
   // ------------------------------------------------------------------
-  // Pads
+  // Keys
   // ------------------------------------------------------------------
 
-  isArmed(pad: number): boolean {
-    return this.armedPads().has(pad);
+  isActive(key: number): boolean {
+    return this.activeKey() === key;
   }
 
-  async togglePad(pad: number): Promise<void> {
-    if (this.isArmed(pad)) this.releasePad(pad);
-    else await this.armPad(pad);
-  }
-
-  /** Start sustaining a pad. If the transport is stopped this also starts playback. */
-  async armPad(pad: number): Promise<void> {
+  /** Press a key: start it, switch to it, or (if it is already on) stop. */
+  async pressKey(key: number): Promise<void> {
+    if (this.activeKey() === key) {
+      this.release();
+      return;
+    }
     await this.ensureContext();
-    if (this.isArmed(pad)) return;
+    const starting = this.activeKey() === null;
     const pos = this.currentPos();
-    for (const layer of this.layersOn(pad)) {
-      this.phases.set(layer.id, startPhase(pos, this.rateFor(layer)));
+    const fade = this.fadeSeconds();
+
+    if (starting) {
+      this.ended.set(false);
+      const len = this.sessionLength();
+      this.startPos = len != null && pos >= len ? 0 : pos;
+      this.startCtxTime = this.ctx!.currentTime;
+      this.position.set(this.startPos);
     }
-    this.armedPads.update((s) => new Set(s).add(pad));
-    if (this.state() === 'playing') {
-      this.startPad(pad, pos, this.fadeSeconds());
-    } else if (this.state() === 'stopped') {
-      await this.play(this.fadeSeconds());
+    this.activeKey.set(key);
+    // Re-tune every sound to the new key, keeping each loop where it was.
+    for (const sound of this.sounds.values()) {
+      const phase = this.phases.get(sound.id);
+      const rate = this.rateFor(sound, key);
+      this.phases.set(
+        sound.id,
+        phase ? retune(phase, this.currentPos(), rate, this.loopDuration(sound.id)) : startPhase(this.currentPos(), rate),
+      );
     }
+    this.swapRig(key, this.currentPos(), starting ? Math.max(CLICK_FADE, fade) : fade);
+    this.scheduleSessionFade();
+    this.startTicking();
   }
 
-  /** Stop sustaining a pad (fades out over the release time). */
-  releasePad(pad: number): void {
-    if (!this.isArmed(pad)) return;
-    this.armedPads.update((s) => {
-      const n = new Set(s);
-      n.delete(pad);
-      return n;
-    });
-    this.stopPad(pad, this.state() === 'playing' ? this.fadeSeconds() : CLICK_FADE);
+  /** Fade everything out and stop the clock, keeping the position. */
+  release(): void {
+    if (!this.rig && this.activeKey() === null) return;
+    const pos = this.currentPos();
+    this.fadeOutRig(this.fadeSeconds());
+    this.activeKey.set(null);
+    this.position.set(pos);
+    this.stopTicking();
+    this.level.set(0);
   }
 
-  releaseAll(): void {
-    for (const pad of [...this.armedPads()]) this.releasePad(pad);
+  /** Stop and go back to the beginning of the session. */
+  stop(): void {
+    this.fadeOutRig(this.activeKey() === null ? CLICK_FADE : Math.min(0.6, this.fadeSeconds()));
+    this.activeKey.set(null);
+    this.stopTicking();
+    this.position.set(0);
+    this.level.set(0);
+    for (const [id, sound] of this.sounds) this.phases.set(id, startPhase(0, this.rateFor(sound, null)));
   }
 
-  private layersOn(pad: number): EngineLayer[] {
-    return [...this.layers.values()].filter((l) => l.padIndex === pad);
+  private swapRig(key: number, pos: number, fade: number): void {
+    const ctx = this.ctx!;
+    this.fadeOutRig(fade);
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+    gain.connect(this.sessionGain!);
+    gain.gain.setValueAtTime(0, ctx.currentTime);
+    gain.gain.linearRampToValueAtTime(1, ctx.currentTime + Math.max(CLICK_FADE, fade));
+    this.rig = { key, gain, voices: new Map() };
+    for (const sound of this.sounds.values()) this.startVoice(sound, pos, fade);
   }
 
-  private startPad(pad: number, pos: number, fade: number): void {
-    for (const layer of this.layersOn(pad)) this.startVoice(layer, pos, fade);
-  }
-
-  private padBus(pad: number): PadBus {
-    let bus = this.pads.get(pad);
-    if (!bus) {
-      const ctx = this.ctx!;
-      const gain = ctx.createGain();
-      gain.gain.value = 0;
-      gain.connect(this.sessionGain!);
-      bus = { gain, voices: new Map() };
-      this.pads.set(pad, bus);
+  private fadeOutRig(fade: number): void {
+    const rig = this.rig;
+    if (!rig || !this.ctx) return;
+    this.rig = null;
+    const now = this.ctx.currentTime;
+    const g = rig.gain.gain;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(g.value, now);
+    g.linearRampToValueAtTime(0, now + fade);
+    for (const v of rig.voices.values()) {
+      try {
+        v.source.stop(now + fade + 0.02);
+      } catch {
+        /* already stopped */
+      }
+      v.source.onended = () => {
+        v.source.disconnect();
+        v.gain.disconnect();
+      };
     }
-    return bus;
+    setTimeout(() => rig.gain.disconnect(), (fade + 0.3) * 1000);
   }
 
-  private startVoice(layer: EngineLayer, pos: number, fade: number): void {
+  private startVoice(sound: EngineSound, pos: number, fade: number): void {
     const ctx = this.ctx;
-    const buffer = this.buffers.get(layer.id);
-    if (!ctx || !buffer || !layer.enabled) return;
-    const bus = this.padBus(layer.padIndex);
-    if (bus.voices.has(layer.id)) return;
+    const rig = this.rig;
+    const buffer = this.buffers.get(sound.id);
+    if (!ctx || !rig || !buffer || !sound.enabled || rig.voices.has(sound.id)) return;
 
     const now = ctx.currentTime;
-    const phase = this.phases.get(layer.id) ?? startPhase(pos, this.rateFor(layer));
-    this.phases.set(layer.id, phase);
+    const rate = this.rateFor(sound, rig.key);
+    const phase = this.phases.get(sound.id) ?? startPhase(pos, rate);
+    this.phases.set(sound.id, phase);
 
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.loop = true;
-    source.playbackRate.value = this.rateFor(layer);
+    source.playbackRate.value = rate;
     const gain = ctx.createGain();
-    source.connect(gain).connect(bus.gain);
+    source.connect(gain).connect(rig.gain);
     source.start(now, offsetAt(phase, pos, buffer.duration));
-    bus.voices.set(layer.id, { source, gain });
 
-    const g = bus.gain.gain;
-    const current = g.value;
-    // A layer joining a pad that is already sounding fades itself in;
-    // otherwise the pad bus provides the fade.
-    const voiceFade = current > 0.99 ? Math.max(CLICK_FADE, fade) : CLICK_FADE;
-    gain.gain.setValueAtTime(0, now);
-    gain.gain.linearRampToValueAtTime(layer.gain, now + voiceFade);
-
-    // Bring the pad bus up (no-op if it is already fully up).
-    g.cancelScheduledValues(now);
-    g.setValueAtTime(current, now);
-    g.linearRampToValueAtTime(1, now + Math.max(CLICK_FADE, fade * (1 - current)));
+    // A sound joining a bus that is already up fades itself in; otherwise the
+    // bus fade does the work.
+    const busUp = rig.gain.gain.value > 0.99;
+    gain.gain.setValueAtTime(busUp ? 0 : sound.gain, now);
+    if (busUp) gain.gain.linearRampToValueAtTime(sound.gain, now + Math.max(CLICK_FADE, fade));
+    rig.voices.set(sound.id, { source, gain });
   }
 
-  private stopVoice(layerId: number, fade: number): void {
-    for (const bus of this.pads.values()) {
-      const v = bus.voices.get(layerId);
-      if (v) {
-        this.fadeAndStop(v, fade);
-        bus.voices.delete(layerId);
-      }
-    }
-  }
-
-  private fadeAndStop(v: Voice, fade: number): void {
-    const ctx = this.ctx!;
-    const now = ctx.currentTime;
+  private stopVoice(soundId: number, fade: number): void {
+    const v = this.rig?.voices.get(soundId);
+    if (!v || !this.ctx) return;
+    this.rig!.voices.delete(soundId);
+    const now = this.ctx.currentTime;
     v.gain.gain.cancelScheduledValues(now);
     v.gain.gain.setValueAtTime(v.gain.gain.value, now);
     v.gain.gain.linearRampToValueAtTime(0, now + fade);
     try {
-      v.source.stop(now + fade + 0.01);
+      v.source.stop(now + fade + 0.02);
     } catch {
       /* already stopped */
     }
@@ -377,94 +385,25 @@ export class AudioEngineService {
     };
   }
 
-  /** Fade a whole pad out, then detach its bus so a re-arm starts fresh. */
-  private stopPad(pad: number, fade: number): void {
-    const bus = this.pads.get(pad);
-    if (!bus || !this.ctx) return;
-    this.pads.delete(pad);
-    const now = this.ctx.currentTime;
-    const g = bus.gain.gain;
-    g.cancelScheduledValues(now);
-    g.setValueAtTime(g.value, now);
-    g.linearRampToValueAtTime(0, now + fade);
-    for (const v of bus.voices.values()) {
-      try {
-        v.source.stop(now + fade + 0.01);
-      } catch {
-        /* ignore */
-      }
-      v.source.onended = () => {
-        v.source.disconnect();
-        v.gain.disconnect();
-      };
-    }
-    setTimeout(() => bus.gain.disconnect(), (fade + 0.2) * 1000);
-  }
-
-  private stopAllVoices(fade: number): void {
-    for (const pad of [...this.pads.keys()]) this.stopPad(pad, fade);
-  }
-
   // ------------------------------------------------------------------
-  // Transport
+  // Session timeline
   // ------------------------------------------------------------------
 
   currentPos(): number {
-    if (this.state() === 'playing' && this.ctx) {
+    if (this.playing() && this.ctx) {
       return this.startPos + (this.ctx.currentTime - this.startCtxTime);
     }
     return this.position();
   }
 
-  async play(fade = CLICK_FADE): Promise<void> {
-    const ctx = await this.ensureContext();
-    if (this.state() === 'playing') return;
-    const len = this.sessionLength();
-    let pos = this.position();
-    if (len != null && pos >= len) pos = 0;
-    this.ended.set(false);
-    this.startPos = pos;
-    this.startCtxTime = ctx.currentTime;
-    this.position.set(pos);
-    this.state.set('playing');
-    for (const pad of this.armedPads()) this.startPad(pad, pos, fade);
-    this.scheduleSessionFade();
-    this.startTicking();
-  }
-
-  pause(): void {
-    if (this.state() !== 'playing') return;
-    const pos = this.currentPos();
-    this.stopAllVoices(CLICK_FADE);
-    this.position.set(pos);
-    this.state.set('paused');
-    this.level.set(0);
-    this.stopTicking();
-  }
-
-  async togglePlay(): Promise<void> {
-    if (this.state() === 'playing') this.pause();
-    else await this.play();
-  }
-
-  /** Stop and return to the start. Pads stay armed so Play brings them back. */
-  stop(): void {
-    if (this.ctx) this.stopAllVoices(this.state() === 'playing' ? Math.min(0.5, this.fadeSeconds()) : CLICK_FADE);
-    this.stopTicking();
-    this.state.set('stopped');
-    this.position.set(0);
-    this.level.set(0);
-    for (const [id, layer] of this.layers) this.phases.set(id, startPhase(0, this.rateFor(layer)));
-  }
-
   seek(target: number): void {
     const len = this.sessionLength();
     const pos = Math.max(0, len == null ? target : Math.min(target, Math.max(0, len - 0.05)));
-    if (this.state() === 'playing' && this.ctx) {
-      this.stopAllVoices(CLICK_FADE);
+    const key = this.activeKey();
+    if (key !== null && this.ctx) {
       this.startPos = pos;
       this.startCtxTime = this.ctx.currentTime;
-      for (const pad of this.armedPads()) this.startPad(pad, pos, CLICK_FADE * 2);
+      this.swapRig(key, pos, CLICK_FADE * 2);
       this.scheduleSessionFade();
     }
     this.position.set(pos);
@@ -481,7 +420,7 @@ export class AudioEngineService {
 
   setSessionLength(seconds: number | null): void {
     this.sessionLength.set(seconds);
-    if (this.state() === 'playing') this.scheduleSessionFade();
+    if (this.playing()) this.scheduleSessionFade();
   }
 
   setMasterVolume(v: number): void {
@@ -491,16 +430,16 @@ export class AudioEngineService {
 
   setFadeSeconds(s: number): void {
     this.fadeSeconds.set(s);
-    if (this.state() === 'playing') this.scheduleSessionFade();
+    if (this.playing()) this.scheduleSessionFade();
   }
 
   setKeyLock(on: boolean): void {
     this.keyLock.set(on);
     const pos = this.currentPos();
-    for (const layer of this.layers.values()) this.applyRate(layer, pos);
+    for (const sound of this.sounds.values()) this.applyRate(sound, pos);
   }
 
-  /** Fade the whole session out so it ends gracefully at the chosen length. */
+  /** Fade the session out so it ends gracefully at the chosen length. */
   private scheduleSessionFade(): void {
     const ctx = this.ctx;
     const g = this.sessionGain?.gain;
@@ -540,7 +479,7 @@ export class AudioEngineService {
   }
 
   private tick = (): void => {
-    if (this.state() !== 'playing') {
+    if (!this.playing()) {
       this.stopTicking();
       return;
     }
@@ -549,7 +488,6 @@ export class AudioEngineService {
     if (len != null && pos >= len) {
       this.stop();
       this.ended.set(true);
-      this.level.set(0);
       return;
     }
     this.position.set(pos);
@@ -583,16 +521,15 @@ export class AudioEngineService {
     });
   }
 
-  /** Debug/testing hook: current playback rate and offset for a layer. */
-  debugLayer(layerId: number): { rate: number; offset: number; sounding: boolean } | null {
-    const layer = this.layers.get(layerId);
-    const phase = this.phases.get(layerId);
-    if (!layer || !phase) return null;
-    const sounding = !!this.pads.get(layer.padIndex)?.voices.has(layerId);
+  /** Debug/testing hook: what a sound is doing right now. */
+  debugSound(soundId: number): { rate: number; offset: number; sounding: boolean } | null {
+    const sound = this.sounds.get(soundId);
+    const phase = this.phases.get(soundId);
+    if (!sound || !phase) return null;
     return {
-      rate: this.rateFor(layer),
-      offset: offsetAt(phase, this.currentPos(), this.loopDuration(layerId)),
-      sounding,
+      rate: this.rateFor(sound, this.activeKey()),
+      offset: offsetAt(phase, this.currentPos(), this.loopDuration(soundId)),
+      sounding: !!this.rig?.voices.has(soundId),
     };
   }
 }

@@ -1,24 +1,32 @@
 /**
- * ".padkit" backup files: a kit's settings and every layer's WAV in one file,
- * so kits can be moved between browsers/devices.
+ * ".padkit" backup files: a kit's settings and every sound's WAV in one file,
+ * so kits can be moved between browsers and devices.
  *
  * Layout: "PADKIT1\n" | uint32 LE header length | UTF-8 JSON header | WAV bytes...
  */
-import { KitSettings, Layer } from './models';
+import { KitSettings, Sound } from './models';
 
 const MAGIC = 'PADKIT1\n';
 
-export type LayerExport = Pick<
-  Layer,
-  'padIndex' | 'originalName' | 'rootNote' | 'octave' | 'fineTuneCents' | 'gain' | 'enabled' | 'detectedKey'
-> & { byteLength: number };
+export type SoundExport = Pick<
+  Sound,
+  'name' | 'rootNote' | 'octave' | 'fineTuneCents' | 'gain' | 'enabled' | 'detectedKey' | 'starterId'
+> & {
+  byteLength: number;
+  // Carried so compressed formats (mp3, m4a, ...) import without decoding;
+  // optional, because kits exported before this was added don't have them.
+  sampleRate?: number;
+  channels?: number;
+  bitsPerSample?: number;
+  durationSeconds?: number;
+};
 
 export interface KitFileHeader {
   app: 'padloop';
   version: 1;
   exportedAt: string;
   kit: KitSettings;
-  layers: LayerExport[];
+  sounds: SoundExport[];
 }
 
 export interface KitFileContents {
@@ -26,7 +34,7 @@ export interface KitFileContents {
   samples: Uint8Array[];
 }
 
-export function encodeKitFile(kit: KitSettings, layers: { layer: Layer; data: Uint8Array }[]): Blob {
+export function encodeKitFile(kit: KitSettings, sounds: { sound: Sound; data: Uint8Array }[]): Blob {
   const header: KitFileHeader = {
     app: 'padloop',
     version: 1,
@@ -38,22 +46,26 @@ export function encodeKitFile(kit: KitSettings, layers: { layer: Layer; data: Ui
       fadeSeconds: kit.fadeSeconds,
       keyLock: kit.keyLock,
     },
-    layers: layers.map(({ layer: l, data }) => ({
-      padIndex: l.padIndex,
-      originalName: l.originalName,
-      rootNote: l.rootNote,
-      octave: l.octave,
-      fineTuneCents: l.fineTuneCents,
-      gain: l.gain,
-      enabled: l.enabled,
-      detectedKey: l.detectedKey,
+    sounds: sounds.map(({ sound: s, data }) => ({
+      name: s.name,
+      rootNote: s.rootNote,
+      octave: s.octave,
+      fineTuneCents: s.fineTuneCents,
+      gain: s.gain,
+      enabled: s.enabled,
+      detectedKey: s.detectedKey,
+      starterId: s.starterId,
       byteLength: data.byteLength,
+      sampleRate: s.sampleRate,
+      channels: s.channels,
+      bitsPerSample: s.bitsPerSample,
+      durationSeconds: s.durationSeconds,
     })),
   };
   const json = new TextEncoder().encode(JSON.stringify(header));
   const len = new Uint8Array(4);
   new DataView(len.buffer).setUint32(0, json.byteLength, true);
-  const parts: BlobPart[] = [MAGIC, len, json, ...layers.map((l) => l.data as Uint8Array<ArrayBuffer>)];
+  const parts: BlobPart[] = [MAGIC, len, json, ...sounds.map((s) => s.data as Uint8Array<ArrayBuffer>)];
   return new Blob(parts, { type: 'application/octet-stream' });
 }
 
@@ -71,13 +83,13 @@ export function decodeKitFile(bytes: Uint8Array): KitFileContents {
   } catch {
     throw bad();
   }
-  if (header?.app !== 'padloop' || header.version !== 1 || !Array.isArray(header.layers)) throw bad();
+  if (header?.app !== 'padloop' || header.version !== 1 || !Array.isArray(header.sounds)) throw bad();
   off += jsonLen;
   const samples: Uint8Array[] = [];
-  for (const l of header.layers) {
-    if (!(l.byteLength >= 0) || off + l.byteLength > bytes.length) throw new Error('Kit file is truncated');
-    samples.push(bytes.slice(off, off + l.byteLength));
-    off += l.byteLength;
+  for (const s of header.sounds) {
+    if (!(s.byteLength >= 0) || off + s.byteLength > bytes.length) throw new Error('Kit file is truncated');
+    samples.push(bytes.slice(off, off + s.byteLength));
+    off += s.byteLength;
   }
   return { header, samples };
 }

@@ -1,17 +1,20 @@
 import { Injectable, signal } from '@angular/core';
 
 import { guessKeyFromFilename } from '../audio/music';
-import { inspectAudio, isSupportedAudioFile, isWavFile } from './audio-formats';
+import { isSupportedAudioFile } from './audio-formats';
 import { DbRequest, DbResponse, SqlValue, Statement } from './db-protocol';
-import { decodeKitFile, encodeKitFile } from './kit-file';
-import { KitDetail, KitPatch, KitSettings, KitSummary, Layer, LayerPatch, MAX_LAYERS_PER_PAD } from './models';
-import { inspectWav } from './wav';
+import { SoundExport, decodeKitFile, encodeKitFile } from './kit-file';
+import { KitDetail, KitPatch, KitSettings, KitSummary, MAX_SOUNDS_PER_KIT, Sound, SoundPatch } from './models';
+import { InvalidWavError, WavInfo, inspectWav } from './wav';
 
 type Row = Record<string, unknown>;
 
 /**
- * The app's data layer: kits, layers and audio data stored in SQLite inside
- * the browser. Everything stays on this device; no server is involved.
+ * The app's data layer: kits, their sounds and the WAV data, all stored in
+ * SQLite inside the browser. Nothing leaves this device.
+ *
+ * Audio is kept once per distinct file (keyed by a content hash), so loading
+ * the same sound into several kits costs no extra space.
  */
 @Injectable({ providedIn: 'root' })
 export class LibraryService {
@@ -77,21 +80,21 @@ export class LibraryService {
 
   async listKits(): Promise<KitSummary[]> {
     const rows = await this.query(`
-      SELECT k.id, k.name, k.updated_at, COUNT(l.id) AS layer_count
-      FROM kit k LEFT JOIN layer l ON l.kit_id = k.id
+      SELECT k.id, k.name, k.updated_at, COUNT(s.id) AS sound_count
+      FROM kit k LEFT JOIN sound s ON s.kit_id = k.id
       GROUP BY k.id ORDER BY k.updated_at DESC, k.id DESC`);
     return rows.map((r) => ({
       id: Number(r['id']),
       name: String(r['name']),
-      layerCount: Number(r['layer_count']),
+      soundCount: Number(r['sound_count']),
       updatedAt: String(r['updated_at']),
     }));
   }
 
   async getKit(id: number): Promise<KitDetail> {
-    const [kits, layers] = await this.run(
+    const [kits, sounds] = await this.run(
       { sql: 'SELECT * FROM kit WHERE id = ?', bind: [id] },
-      { sql: 'SELECT * FROM layer WHERE kit_id = ? ORDER BY pad_index, position, id', bind: [id] },
+      { sql: 'SELECT * FROM sound WHERE kit_id = ? ORDER BY position, id', bind: [id] },
     );
     const k = kits[0];
     if (!k) throw new Error('That kit no longer exists');
@@ -104,7 +107,7 @@ export class LibraryService {
       keyLock: Number(k['key_lock']) !== 0,
       createdAt: String(k['created_at']),
       updatedAt: String(k['updated_at']),
-      layers: layers.map(toLayer),
+      sounds: sounds.map(toSound),
     };
   }
 
@@ -145,61 +148,78 @@ export class LibraryService {
   }
 
   async deleteKit(id: number): Promise<void> {
-    await this.query('DELETE FROM kit WHERE id = ?', id); // layers + samples cascade
+    await this.run({ sql: 'DELETE FROM kit WHERE id = ?', bind: [id] }, { sql: COLLECT_GARBAGE });
   }
 
   // ------------------------------------------------------------------
-  // Layers
+  // Sounds
   // ------------------------------------------------------------------
 
-  /** Validates and stores an audio file as a new layer. `buffer` is the file already decoded (e.g. for key detection), reused here to avoid decoding twice. */
-  async addLayer(
+  /**
+   * Validates an audio file and adds it to the kit. It can then be played in
+   * any key.
+   *
+   * `info` is the metadata the caller already worked out while decoding the
+   * file. Without it, only WAV files can be measured here, since they are the
+   * only format with a header we can read without a decoder.
+   */
+  async addSound(
     kitId: number,
-    padIndex: number,
     file: File,
-    buffer: AudioBuffer,
-    opts: { rootNote?: number | null; detectedKey?: string | null } = {},
-  ): Promise<Layer> {
-    if (!isSupportedAudioFile(file.name)) throw new Error(`${file.name}: unsupported audio format`);
+    opts: {
+      rootNote?: number | null;
+      detectedKey?: string | null;
+      starterId?: string;
+      name?: string;
+      info?: WavInfo;
+    } = {},
+  ): Promise<Sound> {
+    if (!isSupportedAudioFile(file.name)) {
+      throw new InvalidWavError('That file type is not supported');
+    }
     const data = new Uint8Array(await file.arrayBuffer());
-    const bitsPerSample = isWavFile(file.name) ? inspectWav(data).bitsPerSample : 0;
-    const root = opts.rootNote !== undefined ? opts.rootNote : guessKeyFromFilename(file.name);
-    return this.insertLayer(
+    return this.insertSound(
       kitId,
-      padIndex,
-      file.name,
+      opts.name ?? file.name,
       data,
-      { sampleRate: buffer.sampleRate, channels: buffer.numberOfChannels, bitsPerSample, durationSeconds: buffer.duration },
-      { rootNote: root, detectedKey: opts.detectedKey ?? null },
+      {
+        rootNote: opts.rootNote !== undefined ? opts.rootNote : guessKeyFromFilename(file.name),
+        detectedKey: opts.detectedKey ?? null,
+        starterId: opts.starterId ?? null,
+      },
+      opts.info,
     );
   }
 
-  private async insertLayer(
+  private async insertSound(
     kitId: number,
-    padIndex: number,
     name: string,
     data: Uint8Array,
-    info: { sampleRate: number; channels: number; bitsPerSample: number; durationSeconds: number },
-    extra: Partial<Layer>,
-  ): Promise<Layer> {
-    if (!(padIndex >= 0 && padIndex <= 11)) throw new Error('Pad index must be between 0 and 11');
-    const count = await this.query('SELECT COUNT(*) AS n FROM layer WHERE kit_id = ? AND pad_index = ?', kitId, padIndex);
-    if (Number(count[0]['n']) >= MAX_LAYERS_PER_PAD) {
-      throw new Error(`That pad already has ${MAX_LAYERS_PER_PAD} layers`);
+    extra: Partial<Sound>,
+    known?: WavInfo,
+  ): Promise<Sound> {
+    const info = known ?? inspectWav(data);
+    const count = await this.query('SELECT COUNT(*) AS n FROM sound WHERE kit_id = ?', kitId);
+    if (Number(count[0]['n']) >= MAX_SOUNDS_PER_KIT) {
+      throw new Error(`A kit holds up to ${MAX_SOUNDS_PER_KIT} sounds. Remove one first.`);
     }
+    const hash = await hashBytes(data);
     const now = new Date().toISOString();
-    const [inserted] = await this.run(
+    const [, inserted] = await this.run(
+      // Store the audio only if this exact file isn't here already.
+      { sql: 'INSERT OR IGNORE INTO audio_blob (hash, data) VALUES (?, ?)', bind: [hash, data] },
       {
-        sql: `INSERT INTO layer (kit_id, pad_index, position, original_name, size_bytes, sample_rate, channels,
-                                 bits_per_sample, duration_seconds, root_note, octave, fine_tune_cents, gain,
-                                 enabled, detected_key, created_at)
-              VALUES (?1, ?2, (SELECT COALESCE(MAX(position), -1) + 1 FROM layer WHERE kit_id = ?1 AND pad_index = ?2),
-                      ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        sql: `INSERT INTO sound (kit_id, blob_id, position, name, size_bytes, sample_rate, channels,
+                                 bits_per_sample, duration_seconds, root_note, octave, fine_tune_cents,
+                                 gain, enabled, detected_key, starter_id, created_at)
+              VALUES (?1, (SELECT id FROM audio_blob WHERE hash = ?2),
+                      (SELECT COALESCE(MAX(position), -1) + 1 FROM sound WHERE kit_id = ?1),
+                      ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
               RETURNING *`,
         bind: [
           kitId,
-          padIndex,
-          name.slice(-200),
+          hash,
+          cleanName(name),
           data.byteLength,
           info.sampleRate,
           info.channels,
@@ -211,23 +231,23 @@ export class LibraryService {
           clamp(extra.gain ?? 0.8, 0, 2),
           (extra.enabled ?? true) ? 1 : 0,
           extra.detectedKey?.slice(0, 40) ?? null,
+          extra.starterId ?? null,
           now,
         ],
       },
-      { sql: 'INSERT INTO sample (layer_id, data) VALUES (last_insert_rowid(), ?)', bind: [data] },
       { sql: 'UPDATE kit SET updated_at = ? WHERE id = ?', bind: [now, kitId] },
     );
-    return toLayer(inserted[0]);
+    return toSound(inserted[0]);
   }
 
-  async updateLayer(id: number, patch: LayerPatch): Promise<void> {
+  async updateSound(id: number, patch: SoundPatch): Promise<void> {
     const cols: string[] = [];
     const bind: SqlValue[] = [];
     const set = (col: string, v: SqlValue) => {
       cols.push(`${col} = ?`);
       bind.push(v);
     };
-    if (patch.padIndex != null) set('pad_index', clamp(patch.padIndex, 0, 11));
+    if (patch.name != null) set('name', cleanName(patch.name));
     if (patch.clearRootNote) set('root_note', null);
     else if (patch.rootNote != null) set('root_note', clamp(patch.rootNote, 0, 11));
     if (patch.octave != null) set('octave', clamp(patch.octave, -2, 2));
@@ -237,26 +257,35 @@ export class LibraryService {
     if (patch.detectedKey !== undefined) set('detected_key', patch.detectedKey);
     if (!cols.length) return;
     await this.run(
-      { sql: `UPDATE layer SET ${cols.join(', ')} WHERE id = ?`, bind: [...bind, id] },
+      { sql: `UPDATE sound SET ${cols.join(', ')} WHERE id = ?`, bind: [...bind, id] },
       {
-        sql: 'UPDATE kit SET updated_at = ? WHERE id = (SELECT kit_id FROM layer WHERE id = ?)',
+        sql: 'UPDATE kit SET updated_at = ? WHERE id = (SELECT kit_id FROM sound WHERE id = ?)',
         bind: [new Date().toISOString(), id],
       },
     );
   }
 
-  async deleteLayer(id: number): Promise<void> {
-    await this.query('DELETE FROM layer WHERE id = ?', id);
+  async deleteSound(id: number): Promise<void> {
+    await this.run({ sql: 'DELETE FROM sound WHERE id = ?', bind: [id] }, { sql: COLLECT_GARBAGE });
   }
 
-  /** The stored audio bytes for a layer. */
-  async getAudio(layerId: number): Promise<ArrayBuffer> {
-    const rows = await this.query('SELECT data FROM sample WHERE layer_id = ?', layerId);
+  /** The stored WAV bytes for a sound. */
+  async getAudio(soundId: number): Promise<ArrayBuffer> {
+    const rows = await this.query(
+      'SELECT b.data FROM sound s JOIN audio_blob b ON b.id = s.blob_id WHERE s.id = ?',
+      soundId,
+    );
     const data = rows[0]?.['data'];
-    if (!(data instanceof Uint8Array)) throw new Error(`Audio for layer ${layerId} is missing`);
+    if (!(data instanceof Uint8Array)) throw new Error(`Audio for sound ${soundId} is missing`);
     return data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
       ? (data.buffer as ArrayBuffer)
       : (data.slice().buffer as ArrayBuffer);
+  }
+
+  /** Roughly how much space the stored audio takes, in bytes. */
+  async storageUsed(): Promise<number> {
+    const rows = await this.query('SELECT COALESCE(SUM(LENGTH(data)), 0) AS n FROM audio_blob');
+    return Number(rows[0]['n']);
   }
 
   // ------------------------------------------------------------------
@@ -265,11 +294,11 @@ export class LibraryService {
 
   async exportKit(id: number): Promise<Blob> {
     const kit = await this.getKit(id);
-    const layers = [];
-    for (const layer of kit.layers) {
-      layers.push({ layer, data: new Uint8Array(await this.getAudio(layer.id)) });
+    const sounds = [];
+    for (const sound of kit.sounds) {
+      sounds.push({ sound, data: new Uint8Array(await this.getAudio(sound.id)) });
     }
-    return encodeKitFile(kit, layers);
+    return encodeKitFile(kit, sounds);
   }
 
   async importKit(file: File): Promise<KitDetail> {
@@ -278,29 +307,40 @@ export class LibraryService {
     let name = header.kit.name || 'Imported kit';
     for (let i = 2; existing.has(name); i++) name = `${header.kit.name} (${i})`;
     const kit = await this.createKit(name, header.kit);
-    const ctx = new AudioContext();
     try {
-      for (const [i, l] of header.layers.entries()) {
-        const info = await inspectAudio(samples[i], l.originalName, ctx);
-        await this.insertLayer(kit.id, l.padIndex, l.originalName, samples[i], info, l);
+      for (const [i, s] of header.sounds.entries()) {
+        await this.insertSound(kit.id, s.name, samples[i], s, infoFromExport(s));
       }
     } catch (err) {
       await this.deleteKit(kit.id);
       throw err;
-    } finally {
-      void ctx.close();
     }
     return this.getKit(kit.id);
   }
 }
 
-function toLayer(r: Row): Layer {
+/** Drops audio that no sound points at any more. */
+const COLLECT_GARBAGE = 'DELETE FROM audio_blob WHERE id NOT IN (SELECT blob_id FROM sound)';
+
+/** Metadata saved with an exported sound, when the file carries one. */
+function infoFromExport(s: SoundExport): WavInfo | undefined {
+  return s.sampleRate && s.durationSeconds
+    ? {
+        formatCode: 0,
+        channels: s.channels ?? 2,
+        sampleRate: s.sampleRate,
+        bitsPerSample: s.bitsPerSample ?? 0,
+        durationSeconds: s.durationSeconds,
+      }
+    : undefined;
+}
+
+function toSound(r: Row): Sound {
   return {
     id: Number(r['id']),
     kitId: Number(r['kit_id']),
-    padIndex: Number(r['pad_index']),
     position: Number(r['position']),
-    originalName: String(r['original_name']),
+    name: String(r['name']),
     sizeBytes: Number(r['size_bytes']),
     sampleRate: Number(r['sample_rate']),
     channels: Number(r['channels']),
@@ -312,10 +352,32 @@ function toLayer(r: Row): Layer {
     gain: Number(r['gain']),
     enabled: Number(r['enabled']) !== 0,
     detectedKey: r['detected_key'] == null ? null : String(r['detected_key']),
+    starterId: r['starter_id'] == null ? null : String(r['starter_id']),
     createdAt: String(r['created_at']),
   };
 }
 
+function cleanName(name: string): string {
+  const n = name.replace(/\.wave?$/i, '').trim();
+  return (n || 'Sound').slice(0, 80);
+}
+
 function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
+}
+
+/** SHA-256 where available, with a plain fallback for insecure contexts. */
+async function hashBytes(data: Uint8Array): Promise<string> {
+  try {
+    const digest = await crypto.subtle.digest('SHA-256', data as unknown as BufferSource);
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  } catch {
+    let h1 = 0x811c9dc5;
+    let h2 = 0x01000193;
+    for (let i = 0; i < data.length; i++) {
+      h1 = Math.imul(h1 ^ data[i], 16777619) >>> 0;
+      h2 = Math.imul(h2 + data[i] + i, 2246822519) >>> 0;
+    }
+    return `fnv-${data.length}-${h1.toString(16)}${h2.toString(16)}`;
+  }
 }

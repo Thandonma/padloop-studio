@@ -20,6 +20,9 @@ const PATHS: Record<string, string> = {
   speaker: 'M4 9.5h3.5L12 5v14l-4.5-4.5H4zM16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12',
   sparkle: 'M12 3v5M12 16v5M3 12h5M16 12h5M6 6l2.5 2.5M15.5 15.5 18 18M18 6l-2.5 2.5M8.5 15.5 6 18',
   release: 'M5 12h14',
+  check: 'M5 12.5l5 5 9-11',
+  menu: 'M4 7h16M4 12h16M4 17h16',
+  sliders: 'M4 8h10M18 8h2M4 16h3M11 16h9M15 5.5v5M8 13.5v5',
 };
 
 const FILLED = new Set(['play', 'pause', 'stop', 'back', 'forward', 'start']);
