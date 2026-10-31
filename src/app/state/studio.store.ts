@@ -2,8 +2,8 @@ import { Injectable, computed, effect, inject, signal, untracked } from '@angula
 
 import { AudioEngineService } from '../audio/audio-engine.service';
 import { detectKey } from '../audio/key-detect';
-import { guessKeyFromFilename } from '../audio/music';
-import { infoFromBuffer, isSupportedAudioFile } from '../storage/audio-formats';
+import { formatTime, guessKeyFromFilename } from '../audio/music';
+import { MP3_HEAD_BYTES, audioTooLarge, infoFromBuffer, isSupportedAudioFile, shortenLongMp3 } from '../storage/audio-formats';
 import { safeFileName } from '../storage/kit-file';
 import { LibraryService } from '../storage/library.service';
 import { KitDetail, KitPatch, KitSummary, MAX_SOUNDS_PER_KIT, Sound, SoundPatch } from '../storage/models';
@@ -58,7 +58,7 @@ export class StudioStore {
   private pendingSoundPatches = new Map<number, SoundPatch>();
 
   constructor() {
-    this.engine.setAudioLoader((id) => this.library.getAudio(id));
+    this.engine.setAudioLoader((id) => this.library.getPlaybackAudio(id));
     effect(() => {
       const sounds = this.sounds();
       untracked(() => this.engine.setSounds(sounds));
@@ -307,14 +307,20 @@ export class StudioStore {
     }
   }
 
-  private async addFile(kitId: number, file: File): Promise<void> {
-    const job = this.startJob(file.name);
+  private async addFile(kitId: number, original: File): Promise<void> {
+    const job = this.startJob(original.name);
+    const head = new Uint8Array(await original.slice(0, MP3_HEAD_BYTES).arrayBuffer());
+    const tooLarge = audioTooLarge(original, head);
+    if (tooLarge) {
+      job.fail(tooLarge);
+      return;
+    }
+    const file = await shortenLongMp3(original);
     let buffer: AudioBuffer;
     let rootNote = guessKeyFromFilename(file.name);
     let detectedKey: string | null = null;
     try {
-      // decodeAudioData detaches the buffer it is given, so hand it a copy.
-      buffer = await this.engine.decode((await file.arrayBuffer()).slice(0));
+      buffer = await this.engine.decode(await file.arrayBuffer());
       const channels = Array.from({ length: buffer.numberOfChannels }, (_, i) => buffer.getChannelData(i));
       const est = detectKey(channels, buffer.sampleRate);
       detectedKey = est.label;
@@ -335,7 +341,11 @@ export class StudioStore {
       this.engine.prime(sound.id, buffer);
       this.attach(kitId, sound);
       job.done();
-      this.info(`Added ${sound.name}. It plays in whichever key you press.`);
+      this.info(
+        file === original
+          ? `Added ${sound.name}. It plays in whichever key you press.`
+          : `Added the first ${formatTime(buffer.duration)} of ${sound.name}, as a loop. It plays in whichever key you press.`,
+      );
     } catch (err) {
       job.fail(message(err));
     }

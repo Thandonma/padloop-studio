@@ -1,7 +1,7 @@
 import { Injectable, signal } from '@angular/core';
 
 import { guessKeyFromFilename } from '../audio/music';
-import { isSupportedAudioFile } from './audio-formats';
+import { MP3_HEAD_BYTES, isSupportedAudioFile, mp3KeepLength } from './audio-formats';
 import { DbRequest, DbResponse, SqlValue, Statement } from './db-protocol';
 import { SoundExport, decodeKitFile, encodeKitFile } from './kit-file';
 import { KitDetail, KitPatch, KitSettings, KitSummary, MAX_SOUNDS_PER_KIT, Sound, SoundPatch } from './models';
@@ -280,6 +280,30 @@ export class LibraryService {
     return data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
       ? (data.buffer as ArrayBuffer)
       : (data.slice().buffer as ArrayBuffer);
+  }
+
+  /**
+   * The audio to play for a sound. Long MP3s saved before they were shortened
+   * on upload are cut down here, so a kit holding one can still open on a phone.
+   */
+  async getPlaybackAudio(soundId: number): Promise<ArrayBuffer> {
+    const rows = await this.query(
+      `SELECT substr(b.data, 1, ?) AS head, LENGTH(b.data) AS size
+       FROM sound s JOIN audio_blob b ON b.id = s.blob_id WHERE s.id = ?`,
+      MP3_HEAD_BYTES,
+      soundId,
+    );
+    const head = rows[0]?.['head'];
+    if (!(head instanceof Uint8Array)) throw new Error(`Audio for sound ${soundId} is missing`);
+    const size = Number(rows[0]['size']);
+    const keep = mp3KeepLength(head, size);
+    if (keep >= size) return this.getAudio(soundId);
+    const cut = await this.query(
+      'SELECT substr(b.data, 1, ?) AS data FROM sound s JOIN audio_blob b ON b.id = s.blob_id WHERE s.id = ?',
+      keep,
+      soundId,
+    );
+    return (cut[0]['data'] as Uint8Array).slice().buffer as ArrayBuffer;
   }
 
   /** Roughly how much space the stored audio takes, in bytes. */

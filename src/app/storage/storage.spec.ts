@@ -1,4 +1,4 @@
-import { inspectAudio, isSupportedAudioFile, isWavFile } from './audio-formats';
+import { MAX_MP3_AUDIO_BYTES, MP3_HEAD_BYTES, audioTooLarge, inspectAudio, isSupportedAudioFile, isWavFile, mp3KeepLength, shortenLongMp3 } from './audio-formats';
 import { decodeKitFile, encodeKitFile, safeFileName } from './kit-file';
 import { Sound } from './models';
 import { InvalidWavError, inspectWav } from './wav';
@@ -75,6 +75,43 @@ describe('accepted audio formats', () => {
     const fromDecoder = await inspectAudio(new Uint8Array([1, 2, 3]), 'pad.mp3', decode);
     expect(decode).toHaveBeenCalledOnce();
     expect(fromDecoder).toMatchObject({ channels: 1, sampleRate: 48000, durationSeconds: 7.5, bitsPerSample: 0 });
+  });
+});
+
+describe('long audio files', () => {
+  const big = MAX_MP3_AUDIO_BYTES * 6;
+  const head = (...b: number[]) => new Uint8Array([...b, ...new Array(MP3_HEAD_BYTES).fill(0)].slice(0, MP3_HEAD_BYTES));
+
+  it('caps MP3s that start with a frame', () => {
+    expect(mp3KeepLength(head(0xff, 0xfb), big)).toBe(MAX_MP3_AUDIO_BYTES);
+  });
+
+  it('does not count the ID3 tag against the cap', () => {
+    // Synchsafe size: 1 << 7 = 128 bytes.
+    const tagged = new Uint8Array([0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 1, 0]);
+    expect(mp3KeepLength(tagged, big)).toBe(MP3_HEAD_BYTES + 128 + MAX_MP3_AUDIO_BYTES);
+  });
+
+  it('leaves short MP3s and other formats whole', () => {
+    expect(mp3KeepLength(head(0xff, 0xfb), 1000)).toBe(1000);
+    expect(mp3KeepLength(head(0xff, 0xf1), big)).toBe(big); // AAC
+    expect(mp3KeepLength(head(0x52, 0x49, 0x46, 0x46), big)).toBe(big); // WAV
+  });
+
+  it('cuts the file itself, keeping its name', async () => {
+    const bytes = new Uint8Array(MAX_MP3_AUDIO_BYTES + 100);
+    bytes.set([0xff, 0xfb]);
+    const out = await shortenLongMp3(new File([bytes], 'Pad in D.mp3'));
+    expect(out.size).toBe(MAX_MP3_AUDIO_BYTES);
+    expect(out.name).toBe('Pad in D.mp3');
+  });
+
+  it('refuses oversized files that cannot be cut, but not long MP3s', () => {
+    const sized = (name: string, mb: number) => ({ name, size: mb * 1024 * 1024 }) as File;
+    expect(audioTooLarge(sized('a.m4a', 50), head(0, 0))).toContain('16 MB');
+    expect(audioTooLarge(sized('a.wav', 50), head(0x52, 0x49))).toBeNull();
+    expect(audioTooLarge(sized('a.wav', 70), head(0x52, 0x49))).toContain('64 MB');
+    expect(audioTooLarge(sized('a.mp3', 50), head(0xff, 0xfb))).toBeNull();
   });
 });
 

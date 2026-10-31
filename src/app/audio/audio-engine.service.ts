@@ -70,6 +70,8 @@ export class AudioEngineService {
   private sounds = new Map<number, EngineSound>();
   private buffers = new Map<number, AudioBuffer>();
   private pending = new Map<number, Promise<AudioBuffer | null>>();
+  /** Sounds decode one at a time, so opening a kit can't exhaust a phone's memory all at once. */
+  private loadQueue: Promise<unknown> = Promise.resolve();
   private phases = new Map<number, LoopPhase>();
   private rig: Rig | null = null;
 
@@ -173,10 +175,11 @@ export class AudioEngineService {
     let p = this.pending.get(sound.id);
     if (!p) {
       this.setLoading(sound.id, true);
-      p = this.audioLoader(sound.id)
-        .then((data) => this.decode(data))
-        .then((buf) => {
+      p = this.loadQueue
+        .then(async () => {
           if (!this.sounds.has(sound.id)) return null; // deleted meanwhile
+          const buf = await this.decode(await this.audioLoader(sound.id));
+          if (!this.sounds.has(sound.id)) return null;
           if (!this.buffers.has(sound.id)) this.storeBuffer(sound.id, buf);
           return this.buffers.get(sound.id) ?? null;
         })
@@ -187,6 +190,7 @@ export class AudioEngineService {
         })
         .finally(() => this.setLoading(sound.id, false));
       this.pending.set(sound.id, p);
+      this.loadQueue = p;
     }
     return p;
   }
