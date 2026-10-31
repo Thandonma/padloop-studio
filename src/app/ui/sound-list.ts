@@ -1,4 +1,4 @@
-import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 
 import { NOTE_NAMES, formatShift, formatTime, noteName, totalSemitones } from '../audio/music';
 import { StudioStore } from '../state/studio.store';
@@ -39,19 +39,39 @@ import { Waveform } from './waveform';
             {{ pad.name }}
           </button>
         }
-        <label class="btn" [class.opacity-40]="store.isFull() || !store.kit()" title="Add your own audio file">
-          <app-icon name="upload" [size]="15" /> Your audio
-          <input
-            type="file"
-            [attr.accept]="accept"
-            multiple
-            class="sr-only"
-            [disabled]="store.isFull() || !store.kit()"
-            (change)="onPick($event)"
-            data-testid="file-input"
-          />
-        </label>
       </div>
+
+      <!-- Drop zone -->
+      <label
+        class="mt-3 flex flex-col items-center justify-center gap-1 rounded-xl border border-dashed px-4 py-5 text-center transition"
+        [class.cursor-pointer]="canAdd()"
+        [class.opacity-50]="!canAdd()"
+        [style.border-color]="dropping() ? 'rgb(124 242 212 / 0.7)' : 'rgb(255 255 255 / 0.15)'"
+        [style.background]="dropping() ? 'rgb(124 242 212 / 0.08)' : 'transparent'"
+        (dragover)="onDragOver($event)"
+        (dragleave)="onDragLeave($event)"
+        (drop)="onDrop($event)"
+        data-testid="drop-zone"
+      >
+        <app-icon name="upload" [size]="22" />
+        <span class="text-sm font-medium">Upload your own pad: drop audio files here or <span class="underline decoration-dotted underline-offset-2">browse</span></span>
+        <span class="text-xs text-ink-400">
+          @if (store.isFull()) {
+            This kit is full. Remove a sound to add another.
+          } @else {
+            wav, mp3, ogg, m4a, aac, flac or webm. Key is read from the file name, or detected from the audio.
+          }
+        </span>
+        <input
+          type="file"
+          [attr.accept]="accept"
+          multiple
+          class="sr-only"
+          [disabled]="!canAdd()"
+          (change)="onPick($event)"
+          data-testid="file-input"
+        />
+      </label>
 
       <!-- Loading -->
       @for (job of store.jobs(); track job.id) {
@@ -193,6 +213,8 @@ export class SoundList {
   protected readonly note = noteName;
   protected readonly busyWith = signal<string | null>(null);
   protected readonly accept = AUDIO_FILE_ACCEPT;
+  protected readonly dropping = signal(false);
+  protected readonly canAdd = computed(() => !!this.store.kit() && !this.store.isFull());
 
   protected waveColor(key: number | null, enabled: boolean): string {
     return keyColor(key ?? 0, enabled ? 0.9 : 0.3);
@@ -230,6 +252,24 @@ export class SoundList {
     const input = ev.target as HTMLInputElement;
     const files = Array.from(input.files ?? []);
     input.value = '';
+    if (files.length) void this.store.addFiles(files);
+  }
+
+  protected onDragOver(ev: DragEvent): void {
+    ev.preventDefault();
+    this.dropping.set(true);
+  }
+
+  protected onDragLeave(ev: DragEvent): void {
+    // Moving onto the zone's own text also fires dragleave; only react to really leaving.
+    const zone = ev.currentTarget as HTMLElement;
+    if (!zone.contains(ev.relatedTarget as Node | null)) this.dropping.set(false);
+  }
+
+  protected onDrop(ev: DragEvent): void {
+    ev.preventDefault();
+    this.dropping.set(false);
+    const files = Array.from(ev.dataTransfer?.files ?? []);
     if (files.length) void this.store.addFiles(files);
   }
 }
