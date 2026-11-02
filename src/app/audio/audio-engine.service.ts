@@ -1,5 +1,6 @@
 import { Injectable, computed, signal } from '@angular/core';
 
+import { clearStep, markStep } from '../crash-trail';
 import { computePeaks, crossfadeSeconds, makeSeamless } from './loop';
 import { rateForSemitones, totalSemitones } from './music';
 import { LoopPhase, offsetAt, retune, startPhase } from './phase';
@@ -178,9 +179,11 @@ export class AudioEngineService {
       p = this.loadQueue
         .then(async () => {
           if (!this.sounds.has(sound.id)) return null; // deleted meanwhile
+          markStep('opening a saved sound');
           const buf = await this.decode(await this.audioLoader(sound.id));
           if (!this.sounds.has(sound.id)) return null;
           if (!this.buffers.has(sound.id)) this.storeBuffer(sound.id, buf);
+          clearStep();
           return this.buffers.get(sound.id) ?? null;
         })
         .catch((err) => {
@@ -260,6 +263,8 @@ export class AudioEngineService {
       this.release();
       return;
     }
+    markStep('starting to play');
+    setTimeout(clearStep, 3000);
     await this.ensureContext();
     const starting = this.activeKey() === null;
     const pos = this.currentPos();

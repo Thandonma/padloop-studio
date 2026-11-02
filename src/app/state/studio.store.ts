@@ -1,6 +1,7 @@
 import { Injectable, computed, effect, inject, signal, untracked } from '@angular/core';
 
 import { AudioEngineService } from '../audio/audio-engine.service';
+import { clearStep, markStep, takeInterruptedStep } from '../crash-trail';
 import { detectKey } from '../audio/key-detect';
 import { formatTime, guessKeyFromFilename } from '../audio/music';
 import { MP3_HEAD_BYTES, audioTooLarge, infoFromBuffer, isSupportedAudioFile, shortenLongMp3 } from '../storage/audio-formats';
@@ -38,6 +39,8 @@ export class StudioStore {
   readonly toasts = signal<Toast[]>([]);
   readonly loadingKit = signal(false);
   readonly storageError = signal<string | null>(null);
+  /** What a previous visit was doing when the browser closed it, if it was. */
+  readonly interrupted = signal(takeInterruptedStep());
   readonly persistent = this.library.persistent;
   readonly busy = signal(false);
   /** Shows the extra tuning and mixing controls. */
@@ -65,6 +68,8 @@ export class StudioStore {
     });
     effect(() => safeSet(ADVANCED_KEY, this.advanced() ? '1' : '0'));
     addEventListener('pagehide', () => this.flushSaves());
+    addEventListener('error', (ev) => this.error(`Something went wrong: ${ev.message}`));
+    addEventListener('unhandledrejection', (ev) => this.error(`Something went wrong: ${message(ev.reason)}`));
   }
 
   toggleAdvanced(): void {
@@ -309,9 +314,12 @@ export class StudioStore {
 
   private async addFile(kitId: number, original: File): Promise<void> {
     const job = this.startJob(original.name);
+    const step = (what: string) => markStep(`${what} “${original.name}” (${(original.size / 1e6).toFixed(1)} MB)`);
+    step('reading');
     const head = new Uint8Array(await original.slice(0, MP3_HEAD_BYTES).arrayBuffer());
     const tooLarge = audioTooLarge(original, head);
     if (tooLarge) {
+      clearStep();
       job.fail(tooLarge);
       return;
     }
@@ -320,16 +328,21 @@ export class StudioStore {
     let rootNote = guessKeyFromFilename(file.name);
     let detectedKey: string | null = null;
     try {
-      buffer = await this.engine.decode(await file.arrayBuffer());
+      const bytes = await file.arrayBuffer();
+      step('unpacking the audio of');
+      buffer = await this.engine.decode(bytes);
+      step('finding the key of');
       const channels = Array.from({ length: buffer.numberOfChannels }, (_, i) => buffer.getChannelData(i));
       const est = detectKey(channels, buffer.sampleRate);
       detectedKey = est.label;
       rootNote ??= est.tonic;
     } catch {
+      clearStep();
       job.fail('your browser could not decode this audio file');
       return;
     }
     job.set({ stage: 'saving' });
+    step('saving');
     try {
       // The decode above already tells us the sample rate, channels and length,
       // which is the only way to know them for compressed formats.
@@ -338,8 +351,10 @@ export class StudioStore {
         detectedKey,
         info: infoFromBuffer(buffer),
       });
+      step('preparing the loop for');
       this.engine.prime(sound.id, buffer);
       this.attach(kitId, sound);
+      setTimeout(clearStep, 3000);
       job.done();
       this.info(
         file === original
@@ -347,6 +362,7 @@ export class StudioStore {
           : `Added the first ${formatTime(buffer.duration)} of ${sound.name}, as a loop. It plays in whichever key you press.`,
       );
     } catch (err) {
+      clearStep();
       job.fail(message(err));
     }
   }

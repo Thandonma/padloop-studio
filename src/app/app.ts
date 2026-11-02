@@ -100,6 +100,19 @@ import { StatusBar } from './ui/status-bar';
         </div>
       }
 
+      @if (store.interrupted(); as cut) {
+        <div class="panel flex items-start gap-3 border-danger/40 p-4 text-sm" role="alert" data-testid="interrupted">
+          <div class="flex-1">
+            <strong class="text-danger">PadLoop was closed unexpectedly while {{ cut.step }}.</strong>
+            This usually means the browser ran out of memory. If it keeps happening, send a screenshot of this message.
+            <div class="mt-1 text-[11px] break-all text-ink-400">{{ cut.at }} · {{ device }}</div>
+          </div>
+          <button class="text-ink-400 hover:text-ink-100" (click)="store.interrupted.set(null)" aria-label="Dismiss">
+            <app-icon name="x" [size]="14" />
+          </button>
+        </div>
+      }
+
       <app-status-bar />
       <app-keyboard />
       <app-sound-list />
@@ -147,6 +160,7 @@ export class App implements OnInit {
   protected readonly store = inject(StudioStore);
   protected readonly renaming = signal(false);
   protected readonly menuOpen = signal(false);
+  protected readonly device = navigator.userAgent;
 
   ngOnInit(): void {
     // Handy in DevTools: __engine.debugSound(id)
